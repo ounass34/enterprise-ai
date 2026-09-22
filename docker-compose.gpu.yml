@@ -1,0 +1,10 @@
+services:
+  api:
+    environment:
+      LLM_MODE: vllm
+      LLM_BASE_URL: http://vllm:8000/v1
+    depends_on:
+      vllm:
+        condition: service_started
+  vllm:
+    profiles: []

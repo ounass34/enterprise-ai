@@ -1,0 +1,10 @@
+{
+  "realm": "enterprise",
+  "enabled": true,
+  "registrationAllowed": false,
+  "clients": [
+    {"clientId":"enterprise-web","enabled":true,"publicClient":true,"redirectUris":["http://localhost:5173/*"],"webOrigins":["http://localhost:5173"]},
+    {"clientId":"enterprise-ai","enabled":true,"publicClient":false,"secret":"change-me","standardFlowEnabled":true}
+  ],
+  "roles": {"realm":[{"name":"employee"},{"name":"manager"},{"name":"admin"}]}
+}
