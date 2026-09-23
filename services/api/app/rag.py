@@ -1,4 +1,5 @@
 import uuid
+import re
 from pathlib import Path
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
@@ -30,7 +31,55 @@ class RAGService:
         self.client.upsert(self.s.qdrant_collection, points=points)
         return [str(p.id) for p in points]
 
+    def delete_document(self, document_id):
+        selector=models.FilterSelector(filter=models.Filter(must=[models.FieldCondition(key='document_id',match=models.MatchValue(value=document_id))]))
+        self.client.delete(collection_name=self.s.qdrant_collection, points_selector=selector, wait=True)
+
     def search(self, query, limit=6):
         vec=self.embed([f"query: {query}"])[0]
         result=self.client.query_points(collection_name=self.s.qdrant_collection, query=vec, limit=limit, with_payload=True)
-        return result.points
+        semantic_points=result.points
+        terms={term for term in re.findall(r"[a-zàâçéèêëîïôûùüÿñæœ0-9]+", query.lower()) if len(term)>3}
+        aliases={
+            'socadel': {'eneo'},
+            'eneo': {'socadel'},
+            'salaire': {'salary','salaries','wage','wages','remuneration'},
+            'salaires': {'salary','salaries','wage','wages','remuneration'},
+            'grille': {'scale','classification','matrix'},
+            'grilles': {'scale','classification','matrix'},
+            'rémunération': {'salary','wage','remuneration'},
+            'remuneration': {'salary','wage','remuneration'},
+        }
+        for term in list(terms): terms.update(aliases.get(term,set()))
+        terms-= {'donne','donner','moi','pour','avec','dans','cette','quels','quelle'}
+        salary_query=any(term in query.lower() for term in ('grille', 'salaire', 'salary', 'salaries', 'wage', 'remuneration'))
+        if not terms:
+            return semantic_points
+        lexical_points=[]; offset=None
+        while True:
+            points,offset=self.client.scroll(collection_name=self.s.qdrant_collection, limit=256, offset=offset, with_payload=True)
+            lexical_points.extend(points)
+            if offset is None: break
+        ranked=[]
+        priority=[]
+        for point in lexical_points:
+            content=' '.join(str((point.payload or {}).get('content','')).lower().split())
+            filename=str((point.payload or {}).get('filename','')).lower()
+            matches=sum(1 for term in terms if term in content or term in filename)
+            if salary_query and ('salary scale' in content or 'appendix 3' in content or 'grille' in content):
+                matches+=5
+                priority.append(point)
+            if matches: ranked.append((matches,point))
+        ranked.sort(key=lambda item:item[0],reverse=True)
+        merged=[]; seen=set()
+        priority.sort(key=lambda point: (
+            'appendix 3' in ' '.join(str((point.payload or {}).get('content','')).lower().split()),
+            'salary scale' in ' '.join(str((point.payload or {}).get('content','')).lower().split()),
+        ), reverse=True)
+        ordered=priority+[(item[1]) for item in ranked]+semantic_points
+        for point in ordered:
+            point_id=str(point.id)
+            if point_id not in seen:
+                seen.add(point_id); merged.append(point)
+            if len(merged)>=limit: break
+        return merged

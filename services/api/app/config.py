@@ -24,9 +24,15 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://vllm:8000/v1"
     llm_api_key: str = "local-only"
     model_name: str = "Qwen/Qwen3-8B"
+    ollama_base_url: str = "http://ollama:11434"
+    ollama_model: str = "qwen3:1.7b"
     embedding_model: str = "intfloat/multilingual-e5-small"
-    max_context_chunks: int = 6
-    max_history_messages: int = 12
+    max_context_chunks: int = 3
+    max_history_messages: int = 6
+    llm_max_tokens: int = 512
+    chat_timeout_seconds: float = 120.0
+    intent_routing_enabled: bool = True
+    intent_timeout_seconds: float = 8.0
     whisper_model: str = "small"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"

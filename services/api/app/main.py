@@ -1,4 +1,4 @@
-import uuid, json, logging
+import asyncio, uuid, json, logging, re
 from pathlib import Path
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,10 +7,10 @@ from .config import get_settings
 from .auth import get_current_user, CurrentUser
 from .models import ChatRequest, ChatResponse, UserResponse, DocumentResponse, TranscriptionResponse, MemoryRequest
 from .db import db_execute, db_fetchall, db_fetchone
-from .llm import get_llm
+from .llm import classify_intent, get_llm
 from .rag import RAGService
 from .storage import ObjectStorage
-from .document import extract_text, chunk_text
+from .document import extract_salary_scale_markdown, extract_text, chunk_text
 from .voice import transcribe_audio, synthesize_piper
 
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +18,41 @@ s=get_settings(); app=FastAPI(title=s.app_name, version='1.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=[s.web_origin], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 
 rag=None; storage=None
+
+def quick_reply(message: str) -> str | None:
+    normalized=re.sub(r"[^a-zàâçéèêëîïôûùüÿñæœ0-9 ]", "", message.lower()).strip()
+    greetings={"hi","hello","hey","bonjour","salut","bonsoir","good morning","good afternoon","good evening"}
+    if normalized in greetings:
+        return "Bonjour ! Comment puis-je vous aider ?"
+    if normalized in {"merci","thanks","thank you"}:
+        return "Avec plaisir !"
+    return None
+
+def is_document_catalog_request(message: str) -> bool:
+    normalized=re.sub(r"[^a-zàâçéèêëîïôûùüÿñæœ0-9 ]", "", message.lower()).strip()
+    catalog_terms=('document', 'source', 'référence', 'reference')
+    state_terms=('disponible', 'upload', 'charg', 'présent', 'present')
+    return any(term in normalized for term in catalog_terms) and any(term in normalized for term in state_terms)
+
+def supports_catalog_intent(message: str) -> bool:
+    normalized=message.lower()
+    catalog_signals=('disponible', 'disponibles', 'chargé', 'chargés', 'chargées', 'chargées', 'upload', 'référence', 'reference', 'fichier', 'fichiers', 'liste', 'ressource', 'ressources')
+    return any(signal in normalized for signal in catalog_signals)
+
+def is_knowledge_question(message: str) -> bool:
+    normalized=message.lower().strip()
+    question_words=('qui', 'que', 'quoi', 'quel', 'quelle', 'quels', 'quelles', 'comment', 'pourquoi', 'où', 'quand', 'combien')
+    action_words=('explique', 'décris', 'décrire', 'donne-moi', 'donne moi', 'liste', 'présente')
+    return '?' in normalized or normalized.startswith(question_words) or normalized.startswith(action_words)
+
+def is_topic_request(message: str) -> bool:
+    words=message.lower().strip().split()
+    personal_starts=('je ', "j'", 'j’', 'nous ', 'il ', 'elle ', 'ils ', 'elles ', 'mon ', 'ma ', 'mes ')
+    return 1 < len(words) <= 8 and not message.lower().strip().startswith(personal_starts)
+
+def requests_salary_table(message: str) -> bool:
+    normalized=message.lower()
+    return any(term in normalized for term in ('grille salariale', 'grille de salaire', 'grille chiffr', 'salary scale'))
 @app.on_event('startup')
 async def startup():
     global rag,storage
@@ -59,18 +94,71 @@ async def chat(req:ChatRequest,user:CurrentUser=Depends(get_current_user)):
         cid=str(uuid.uuid4()); await db_execute('INSERT INTO conversations(id,user_id,title) VALUES(:id,:u,:t)',{'id':cid,'u':u['id'],'t':req.message[:80]})
     history=await db_fetchall('SELECT role,content FROM messages WHERE conversation_id=:c ORDER BY created_at DESC LIMIT :lim',{'c':cid,'lim:s':s.max_history_messages} if False else {'c':cid,'lim':s.max_history_messages})
     history=list(reversed([{'role':x['role'],'content':x['content']} for x in history]))
-    citations=[]; context=''
-    if req.use_knowledge:
+    citations=[]; context=''; cited_documents=set(); retrieved_chunks=[]
+    answer=quick_reply(req.message)
+    catalog_request=is_document_catalog_request(req.message)
+    intent=None
+    direct_knowledge=is_knowledge_question(req.message) or is_topic_request(req.message)
+    if answer is None and not catalog_request and not direct_knowledge and req.use_knowledge and s.intent_routing_enabled and len(req.message) <= 180:
+        intent=await classify_intent(req.message, history)
+        catalog_request=intent == 'document_catalog' and supports_catalog_intent(req.message)
+        if intent == 'document_catalog' and not catalog_request:
+            intent='knowledge_question'
+    salary_table=requests_salary_table(req.message)
+    if direct_knowledge:
+        intent='knowledge_question'
+    if answer is None and catalog_request:
+        rows=await db_fetchall('SELECT filename,status FROM documents ORDER BY created_at DESC')
+        if rows:
+            answer='Documents sources disponibles :\n\n'+'\n'.join(f"- {row['filename']} ({row['status']})" for row in rows)
+        else:
+            answer='Aucun document source n’est disponible pour le moment.'
+    search_knowledge=answer is None and req.use_knowledge and (intent == 'knowledge_question' or (intent is None and is_knowledge_question(req.message)))
+    if search_knowledge:
         try:
-            hits=rag.search(req.message,s.max_context_chunks)
+            retrieval_limit=1 if any(term in req.message.lower() for term in ('grille', 'salaire', 'salary', 'wage')) else s.max_context_chunks
+            previous_topics=' '.join(item['content'] for item in history if item['role'] == 'user')[-1000:]
+            retrieval_query=f'{previous_topics} {req.message}'.strip()
+            retrieval_limit=1 if any(term in retrieval_query.lower() for term in ('grille', 'salaire', 'salary', 'wage')) else retrieval_limit
+            hits=rag.search(retrieval_query,retrieval_limit)
             for h in hits:
-                p=h.payload or {}; citations.append({'document_id':p.get('document_id',''),'filename':p.get('filename',''),'chunk_index':p.get('chunk_index',0),'score':float(h.score)})
-            context='\n\n'.join(f"[Source: {p.get('filename')} / chunk {p.get('chunk_index')}]\n{p.get('content','')}" for p in [h.payload or {} for h in hits])
+                p=h.payload or {}; retrieved_chunks.append(p); document_key=p.get('document_id') or p.get('filename','')
+                if document_key not in cited_documents:
+                    cited_documents.add(document_key)
+                    citations.append({'document_id':p.get('document_id',''),'filename':p.get('filename',''),'chunk_index':p.get('chunk_index',0),'score':float(getattr(h,'score',0.0) or 0.0)})
+            context_limit=2200 if salary_table else 800
+            context_parts=[]
+            for p in [h.payload or {} for h in hits]:
+                raw_content=str(p.get('content',''))
+                content=raw_content if salary_table else ' '.join(raw_content.split())
+                if salary_table:
+                    marker=content.lower().find('appendix 3 salary scale')
+                    if marker >= 0:
+                        content=content[marker:]
+                context_parts.append(f"[Source: {p.get('filename')} / chunk {p.get('chunk_index')}]\n{content[:context_limit]}")
+            context='\n\n'.join(context_parts)
         except Exception as e: logging.warning('RAG unavailable: %s',e)
-    system='''You are Enterprise AI, a sovereign internal employee assistant. Answer clearly and safely. Never invent company policy. If knowledge sources are provided, prioritize them and cite them by filename. If evidence is insufficient, say so. Do not expose confidential information outside the user's authorized context.'''
+    if salary_table and retrieved_chunks:
+        document_id=retrieved_chunks[0].get('document_id')
+        document_row=await db_fetchone('SELECT object_key FROM documents WHERE id=:d',{'d':document_id}) if document_id else None
+        if document_row:
+            structured_table=extract_salary_scale_markdown(storage.get(document_row['object_key']))
+            if structured_table:
+                answer='Voici la grille salariale extraite de l’Appendice 3 :\n\n'+structured_table
+    system='''You are Enterprise AI, a sovereign internal employee assistant. Answer clearly and safely. Never invent company policy. In this knowledge base, SOCADEL is the new name of former ENEO; treat both names as the same organization. If knowledge sources are provided, prioritize them. Answer in the language of the user's latest message: French for French questions, English for English questions. Use the conversation history to resolve follow-ups such as "cette grille" or "this scale". For broad summary questions, give at most 3 numbered items, with each description limited to 12 words. End every sentence completely. Do not include a source list or repeat document filenames in your answer; the interface displays sources separately. If evidence is insufficient, say so. Do not expose confidential information outside the user's authorized context.'''
+    if requests_salary_table(req.message):
+        system += '\nFor a salary-scale request, use only the APPENDIX 3 SALARY SCALE section, never the job classification matrix. Reproduce every available numeric row from that section as a Markdown table. Use columns Echelon, Minimum, Médian, Maximum. Preserve the source numbers exactly and do not invent missing values; write "non lisible" where the PDF extraction does not establish a value. Add one brief note if the source layout is ambiguous.'
     if context: system += '\n\nEnterprise knowledge:\n'+context
-    messages=[{'role':'system','content':system}]+history+[{'role':'user','content':req.message}]
-    answer=await get_llm().chat(messages)
+    if answer is None:
+        messages=[{'role':'system','content':system}]+history+[{'role':'user','content':req.message}]
+        try:
+            answer=await asyncio.wait_for(get_llm().chat(messages), timeout=s.chat_timeout_seconds)
+        except Exception as e:
+            if isinstance(e, asyncio.TimeoutError) and retrieved_chunks:
+                answer='Je n’ai pas pu produire une réponse fiable dans le délai imparti. Veuillez réessayer.'
+            else:
+                logging.exception('LLM request failed')
+                raise HTTPException(503, f'Le modèle est indisponible ou n’a pas répondu à temps: {e}')
     mid=str(uuid.uuid4())
     await db_execute('INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES(:id,:c,:r,:x,:m)',{'id':str(uuid.uuid4()),'c':cid,'r':'user','x':req.message,'m':'{}'})
     await db_execute('INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES(:id,:c,:r,:x,:m)',{'id':mid,'c':cid,'r':'assistant','x':answer,'m':json.dumps({'citations':citations})})
