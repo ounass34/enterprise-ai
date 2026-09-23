@@ -28,7 +28,7 @@ A self-hosted enterprise AI platform designed for an employee assistant with tex
 ## Quick start
 
 1. Copy `.env.example` to `.env`.
-2. For a CPU-only development API, set `LLM_MODE=mock`.
+2. For CPU-only local inference, set `LLM_MODE=ollama` and use the `qwen3:1.7b` model.
 3. For local GPU inference, set `LLM_MODE=vllm`, install NVIDIA Container Toolkit, and start with the GPU compose file.
 4. Start:
 
@@ -39,7 +39,14 @@ docker compose --env-file .env -f docker-compose.yml up -d --build
 For GPU:
 
 ```bash
-docker compose --env-file .env -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+docker compose --env-file .env --profile gpu -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
+
+For CPU fallback with Ollama:
+
+```bash
+docker compose --env-file .env --profile cpu up -d --build
+docker compose --env-file .env exec ollama ollama pull qwen3:1.7b
 ```
 
 5. Open the web application at `http://localhost:5173`.
